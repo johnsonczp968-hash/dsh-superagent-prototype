@@ -3,8 +3,10 @@
  * Variables read by workers avoid `KEY|PASSWORD|SECRET|TOKEN` in their names because DSH strips credential-shaped variables from child environments.
  * Provides default-path guardrails rather than an OS-level security boundary, as workers run under the operator's OS user.
  */
+import { randomUUID } from 'node:crypto'
 import { lstat, mkdir, readdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { realpathSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { delimiter, join, resolve } from 'node:path'
 import type { SubprocessOutputReader, SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
 import type { Deployment } from '../deployment.ts'
@@ -157,13 +159,33 @@ export async function runAsWorker(subprocess: SubprocessRuntime, argv: string[],
   throw new CliError(read(handle.collected.stderr).trim() || `${argv.join(' ')} ${ended}`, undefined, exitCode ?? undefined)
 }
 
+/** A shell command line materialized for this platform, with the cleanup that removes any file it needed. */
+export interface ShellScript { argv: string[]; env: Record<string, string>; dispose: () => Promise<void> }
+
+/** Environment variable naming the batch file that carries a prepare command line on Windows. */
+const SCRIPT_VARIABLE = 'DSH_SUPERAGENT_SCRIPT'
+
 /**
- * Returns the argv that runs a shell command line on this platform: `sh -c` on POSIX, and `cmd /d /s /c` on Windows,
- * whose PATH carries no POSIX `sh` (Git for Windows ships one only under its own installation directory).
+ * Materializes a shell command line for this platform.
+ * POSIX runs the line through `sh -c`. Windows cannot pass the line as a `cmd /c` argument: the subprocess service
+ * re-serializes argv for CreateProcess, so the double quotes a real command line contains reach the child as literal
+ * characters (`git -C "C:\path"` then fails with `cannot change to '"C:\path"'`). The line therefore goes to a `.cmd`
+ * file, and `cmd` is told to run it through `%DSH_SUPERAGENT_SCRIPT%` — an expansion of an argv token that holds no
+ * quotes and no spaces, so the batch file's own quoting is read by cmd alone. The variable's value is quoted, which keeps
+ * a temporary directory with a space in its path working. The daemon's PATH carries no POSIX `sh` for the other branch:
+ * Git for Windows ships one only under its own installation directory.
  */
-export const shellCommand = (command: string): string[] => process.platform === 'win32'
-  ? [process.env.ComSpec ?? 'cmd.exe', '/d', '/s', '/c', command]
-  : ['sh', '-c', command]
+export async function shellScript(command: string): Promise<ShellScript> {
+  if (process.platform !== 'win32') return { argv: ['sh', '-c', command], env: {}, dispose: async () => { /* Nothing to remove. */ } }
+  const file = join(tmpdir(), `dsh-superagent-${randomUUID()}.cmd`)
+  // `@echo off` keeps the line out of the captured output; the line itself is written verbatim so cmd reads its quoting.
+  await writeFile(file, `@echo off\r\n${command}\r\n`, { mode: 0o755 })
+  return {
+    argv: [process.env.ComSpec ?? 'cmd.exe', '/d', '/s', '/c', `%${SCRIPT_VARIABLE}%`],
+    env: { [SCRIPT_VARIABLE]: `"${file}"` },
+    dispose: async () => { await unlink(file).catch(() => { /* Already gone. */ }) },
+  }
+}
 
 /** Verifies that worker git invocations resolve the deployment's GitHub credential helper. */
 export async function verifyEnvironment(deployment: Pick<Deployment, 'github' | 'stateDir'>, subprocess: SubprocessRuntime, signal: AbortSignal): Promise<void> {

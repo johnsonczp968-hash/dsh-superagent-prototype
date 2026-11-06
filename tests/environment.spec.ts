@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { SENSITIVE_ENV_PATTERN, type SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
-import { GIT_LOCATION, agentVariables, credentialHelper, runAsWorker, shimFile, verifyDirectory, withoutDirectory, workerBin, workerGitConfig, writeEnvironment }
+import { GIT_LOCATION, agentVariables, credentialHelper, runAsWorker, shellScript, shimFile, verifyDirectory, withoutDirectory, workerBin, workerGitConfig, writeEnvironment }
   from '../src/infra/environment.ts'
 import { CliError } from '../src/infra/commands.ts'
 import { testDeployment } from './fixtures/deployment.ts'
@@ -158,6 +158,25 @@ describe('ticket directory check', () => {
     const error = await runAsWorker(subprocess(join(dir, 'global')), failing, dir, signal).catch((e: unknown) => e)
     expect(error).toBeInstanceOf(CliError)
     expect(error).toMatchObject({ message: 'nope', exitCode: 3 })
+  })
+})
+
+describe('the shell script that runs a prepare command line', () => {
+  it('keeps the line\'s own quoting intact and removes the file it needed', async () => {
+    // The quoting in this line is what a Windows `cmd /c` argument mangles: the line must be read by one parser only.
+    const script = await shellScript('echo "quoted argument"')
+    const file = script.env.DSH_SUPERAGENT_SCRIPT?.replace(/^"|"$/g, '')
+    if (process.platform === 'win32') {
+      expect(script.argv).toEqual([process.env.ComSpec ?? 'cmd.exe', '/d', '/s', '/c', '%DSH_SUPERAGENT_SCRIPT%'])
+      expect(readFileSync(file!, 'utf8')).toContain('echo "quoted argument"')
+    }
+    try {
+      const { stdout } = await exec(script.argv[0]!, script.argv.slice(1), { timeout: 15_000, env: { ...process.env, ...script.env } })
+      expect(stdout.trim()).toBe(process.platform === 'win32' ? '"quoted argument"' : 'quoted argument')
+    } finally {
+      await script.dispose()
+    }
+    if (process.platform === 'win32') expect(() => readFileSync(file!)).toThrow()
   })
 })
 
