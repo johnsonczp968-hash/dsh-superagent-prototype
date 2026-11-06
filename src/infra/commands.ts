@@ -8,6 +8,17 @@ import type { Deployment } from '../deployment.ts'
 const exec = promisify(execFile)
 const TIMEOUT_MS = 90_000
 /**
+ * The program, its arguments, and whether they form one verbatim command line.
+ * Windows starts a `.cmd` or `.bat` such as an agent's `gh` wrapper only through `cmd.exe`: `execFile` refuses to launch
+ * one directly (`spawn EINVAL`), and passing the arguments along lets `cmd` split one such as
+ * `notifications?all=true&per_page=50` at its `&`. The line is therefore quoted here and handed to `cmd` verbatim.
+ */
+function launch(program: string, args: string[]): { file: string, argv: string[], verbatim: boolean } {
+  if (process.platform !== 'win32' || !/\.(?:cmd|bat)$/i.test(program)) return { file: program, argv: args, verbatim: false }
+  const parts = [program, ...args].map(arg => `"${arg.replace(/"/g, '""')}"`)
+  return { file: process.env.ComSpec ?? 'cmd.exe', argv: ['/d', '/s', '/c', `"${parts.join(' ')}"`], verbatim: true }
+}
+/**
  * Error thrown by Commands when a CLI invocation fails, capturing stderr diagnostics, API error codes, and exit status without echoing command arguments.
  * Source channels and pollers inspect its code to distinguish deleted conversations from retryable failures.
  */
@@ -66,8 +77,10 @@ export class Commands {
   get repository(): string { return this.deployment.repository }
   withSignal(signal?: AbortSignal): Commands { return signal ? new Commands(this.resolved, this.environment, AbortSignal.any([this.signal, signal])) : this }
   async run(program: string, args: string[], cwd?: string): Promise<string> {
+    const { file, argv, verbatim } = launch(program, args)
     try {
-      const { stdout } = await exec(program, args, { cwd, signal: this.signal, timeout: TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024,
+      const { stdout } = await exec(file, argv, { cwd, signal: this.signal, timeout: TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024,
+        ...verbatim ? { windowsVerbatimArguments: true } : {},
         env: { ...process.env, ...this.environment, GH_PROMPT_DISABLED: '1', LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' } })
       return stdout
     } catch (error) { throw commandError(error, program) }

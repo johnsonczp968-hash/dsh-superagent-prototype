@@ -57,10 +57,10 @@ export function agentVariables(stateDir: string): Record<string, string | undefi
   }
 }
 
-/** True when a regular file starts with the dsh-superagent marker in its first two lines; a symbolic link, directory, or other non-regular file never counts as written by dsh-superagent. */
+/** True when a regular file starts with the dsh-superagent marker in its first two lines; a symbolic link, directory, or other non-regular file never counts as written by dsh-superagent. A Windows `.cmd` shim can only carry the marker after a `rem` prefix, which is stripped before the comparison. */
 async function written(file: string): Promise<boolean> {
   if (!(await lstat(file)).isFile()) return false
-  const head = (await readFile(file, 'utf8')).split('\n', 2)
+  const head = (await readFile(file, 'utf8')).split('\n', 2).map(line => line.replace(/^rem\s+/i, '').trimEnd())
   return [MARKER, ...LEGACY_MARKERS].some(marker => head.includes(marker))
 }
 async function own(file: string, text: string, mode = 0o644): Promise<void> {
@@ -73,11 +73,18 @@ async function own(file: string, text: string, mode = 0o644): Promise<void> {
 }
 
 /**
+ * Returns the file name a worker shim takes on this platform: the bare command name on POSIX, and that name with `.cmd`
+ * on Windows, which has no `#!/bin/sh` interpreter and resolves a bare name to `.cmd` through PATHEXT.
+ */
+export const shimFile = (name: string): string => process.platform === 'win32' ? `${name}.cmd` : name
+
+/**
  * Atomically writes worker CLI shims and the isolated git configuration file into the state directory, refusing to overwrite foreign files.
  * Each shim strips the shim directory from PATH before exec so wrapper scripts resolving `gh` or `lark-cli` by name reach the real binary.
  */
 export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' | 'repository' | 'github' | 'feishu'>, blockedCommands: readonly string[]): Promise<void> {
   const { stateDir, repository, github, feishu } = deployment
+  const win32 = process.platform === 'win32'
   const dir = workerBin(stateDir)
   await mkdir(dir, { recursive: true })
   const before = await readdir(dir)
@@ -85,18 +92,34 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
   // Workers may be running concurrently: write each shim to a temp file and atomically rename it so no command ever resolves past the shim directory.
   const kept = new Set<string>()
   const shim = async (name: string, body: string): Promise<void> => {
-    const temporary = join(dir, `.${name}.${process.pid}.tmp`)
-    await writeFile(temporary, `#!/bin/sh\n${MARKER}\n${body}\n`, { mode: 0o755 })
-    await rename(temporary, join(dir, name))
-    kept.add(name)
+    const file = shimFile(name)
+    const temporary = join(dir, `.${file}.${process.pid}.tmp`)
+    await writeFile(temporary, win32 ? `@echo off\r\nrem ${MARKER}\r\n${body}\r\n` : `#!/bin/sh\n${MARKER}\n${body}\n`, { mode: win32 ? 0o644 : 0o755 })
+    await rename(temporary, join(dir, file))
+    kept.add(file)
   }
-  const withoutShims = [
-    `self=${shellQuote(dir)}`, 'rest=', 'IFS=:', 'set -f',
-    'for entry in $PATH; do [ "$entry" = "$self" ] || rest="${rest:+$rest:}$entry"; done',
-    'set +f', 'unset IFS', 'PATH=$rest', 'export PATH',
-  ].join('\n')
-  const run = (program: string): string => `${withoutShims}\nexec ${shellQuote(program)} "$@"`
-  const fail = (message: string): string => `echo ${shellQuote(message)} >&2\nexit 1`
+  // Batch has no arrays: split PATH on `;` through the quoted-list trick, then rebuild it without the shim directory.
+  const withoutShims = win32
+    ? [
+      'setlocal enabledelayedexpansion',
+      'set "SELF=%~dp0"', 'set "SELF=!SELF:~0,-1!"', 'set "REST="',
+      'for %%P in ("!PATH:;=" "!") do (',
+      '  set "ENTRY=%%~P"',
+      '  if /i not "!ENTRY!"=="!SELF!" set "REST=!REST!;!ENTRY!"',
+      ')',
+      'set "PATH=!REST:~1!"',
+    ].join('\r\n')
+    : [
+      `self=${shellQuote(dir)}`, 'rest=', 'IFS=:', 'set -f',
+      'for entry in $PATH; do [ "$entry" = "$self" ] || rest="${rest:+$rest:}$entry"; done',
+      'set +f', 'unset IFS', 'PATH=$rest', 'export PATH',
+    ].join('\n')
+  const run = (program: string): string => win32
+    ? `${withoutShims}\r\n"${program}" %*\r\nexit /b %ERRORLEVEL%`
+    : `${withoutShims}\nexec ${shellQuote(program)} "$@"`
+  const fail = (message: string): string => win32
+    ? `echo ${message.replace(/[%^&|<>]/g, char => `^${char}`)} 1>&2\r\nexit /b 1`
+    : `echo ${shellQuote(message)} >&2\nexit 1`
   await shim('gh', run(github.cli))
   await shim('lark-cli', feishu ? run(feishu.cli) : fail('lark-cli is unavailable: this installation has no Feishu bot.'))
   for (const name of new Set(blockedCommands.filter(name => !WORKER_COMMANDS.includes(name)))) {
@@ -133,6 +156,14 @@ export async function runAsWorker(subprocess: SubprocessRuntime, argv: string[],
   const ended = exitCode === null ? 'was stopped before it finished' : `exited with ${exitCode}`
   throw new CliError(read(handle.collected.stderr).trim() || `${argv.join(' ')} ${ended}`, undefined, exitCode ?? undefined)
 }
+
+/**
+ * Returns the argv that runs a shell command line on this platform: `sh -c` on POSIX, and `cmd /d /s /c` on Windows,
+ * whose PATH carries no POSIX `sh` (Git for Windows ships one only under its own installation directory).
+ */
+export const shellCommand = (command: string): string[] => process.platform === 'win32'
+  ? [process.env.ComSpec ?? 'cmd.exe', '/d', '/s', '/c', command]
+  : ['sh', '-c', command]
 
 /** Verifies that worker git invocations resolve the deployment's GitHub credential helper. */
 export async function verifyEnvironment(deployment: Pick<Deployment, 'github' | 'stateDir'>, subprocess: SubprocessRuntime, signal: AbortSignal): Promise<void> {
